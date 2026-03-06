@@ -1,0 +1,266 @@
+# Kafka Topic Configuration
+# MedallionHealth – All topics with production-grade settings
+
+# ============================================================
+# TOPIC NAMING CONVENTION
+# {domain}.{entity}.{event_type}.v{version}
+# Partition key: tenant_id (50 partitions = 1 per hospital)
+# ============================================================
+
+---
+# IDENTITY DOMAIN
+---
+topic: identity.patient.registered.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 2592000000        # 30 days
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  compression_type: lz4
+  schema_subject: identity.patient.registered-value
+  partition_key: tenant_id
+  consumer_groups:
+    - clinical-admission-service
+    - scheduling-appointment-service
+    - billing-service
+    - audit-consumer
+    - bronze-ingestion-patient
+
+---
+topic: identity.patient.updated.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 2592000000        # 30 days
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  compression_type: lz4
+  partition_key: tenant_id
+  consumer_groups:
+    - clinical-admission-service
+    - audit-consumer
+    - bronze-ingestion-patient
+
+---
+topic: identity.patient.merged.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 604800000         # 7 days
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  partition_key: tenant_id
+  consumer_groups:
+    - identity-merge-processor
+    - audit-consumer
+
+---
+# CLINICAL DOMAIN
+---
+topic: clinical.admission.created.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 7776000000        # 90 days
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  compression_type: lz4
+  partition_key: tenant_id
+  consumer_groups:
+    - operations-bed-service
+    - billing-service
+    - audit-consumer
+    - bronze-ingestion-admission
+    - ml-readmission-feature-builder
+
+---
+topic: clinical.admission.updated.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 7776000000
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  partition_key: tenant_id
+  consumer_groups:
+    - operations-bed-service
+    - audit-consumer
+    - bronze-ingestion-admission
+
+---
+topic: clinical.discharge.completed.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 7776000000
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  partition_key: tenant_id
+  consumer_groups:
+    - operations-bed-service
+    - billing-service
+    - audit-consumer
+    - bronze-ingestion-admission
+    - ml-readmission-feature-builder
+
+---
+# OPERATIONS DOMAIN
+---
+topic: operations.bed.status_changed.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 604800000         # 7 days (high-frequency, use compaction for current state)
+  cleanup_policy: compact,delete
+  min_insync_replicas: 2
+  compression_type: lz4
+  partition_key: tenant_id
+  message_key: "{tenant_id}#{bed_id}"  # compact on bed_id within tenant
+  consumer_groups:
+    - clinical-admission-service
+    - audit-consumer
+    - bronze-ingestion-bed
+    - realtime-bed-dashboard
+
+---
+topic: operations.bed.assigned.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 2592000000
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  partition_key: tenant_id
+  consumer_groups:
+    - clinical-admission-service
+    - audit-consumer
+    - bronze-ingestion-bed
+
+---
+# SCHEDULING DOMAIN
+---
+topic: scheduling.appointment.booked.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 7776000000
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  compression_type: lz4
+  partition_key: tenant_id
+  consumer_groups:
+    - clinical-admission-service
+    - billing-service
+    - workforce-utilization-tracker
+    - audit-consumer
+    - bronze-ingestion-appointment
+
+---
+topic: scheduling.appointment.cancelled.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 7776000000
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  partition_key: tenant_id
+  consumer_groups:
+    - workforce-utilization-tracker
+    - audit-consumer
+    - bronze-ingestion-appointment
+
+---
+topic: scheduling.appointment.completed.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 7776000000
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  partition_key: tenant_id
+  consumer_groups:
+    - billing-service
+    - workforce-utilization-tracker
+    - audit-consumer
+    - bronze-ingestion-appointment
+    - ml-readmission-feature-builder
+
+---
+# WORKFORCE DOMAIN
+---
+topic: workforce.doctor.availability_updated.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 604800000         # 7 days (compacted — only need current availability)
+  cleanup_policy: compact,delete
+  min_insync_replicas: 2
+  partition_key: tenant_id
+  message_key: "{tenant_id}#{doctor_id}#{effective_date}"
+  consumer_groups:
+    - scheduling-appointment-service
+    - audit-consumer
+    - bronze-ingestion-workforce
+    - ml-workload-optimizer
+
+---
+# FINANCE DOMAIN
+---
+topic: finance.billing.generated.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 31536000000       # 365 days (financial data - long retention)
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  compression_type: lz4
+  partition_key: tenant_id
+  consumer_groups:
+    - finance-reporting-service
+    - audit-consumer
+    - bronze-ingestion-billing
+
+---
+topic: finance.payment.received.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 31536000000
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  partition_key: tenant_id
+  consumer_groups:
+    - finance-reporting-service
+    - audit-consumer
+    - bronze-ingestion-billing
+
+---
+topic: finance.claim.submitted.v1
+config:
+  partitions: 50
+  replication_factor: 3
+  retention_ms: 31536000000
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  partition_key: tenant_id
+  consumer_groups:
+    - insurance-claim-processor
+    - audit-consumer
+    - bronze-ingestion-billing
+
+---
+# AUDIT DOMAIN (Cross-Cutting)
+---
+topic: audit.access.logged.v1
+config:
+  partitions: 100              # Higher partitions — all services write to this
+  replication_factor: 3
+  retention_ms: 63072000000   # 2 years (HIPAA compliance)
+  cleanup_policy: delete
+  min_insync_replicas: 2
+  compression_type: lz4
+  partition_key: tenant_id
+  consumer_groups:
+    - audit-storage-consumer
+    - compliance-monitor
