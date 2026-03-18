@@ -1,0 +1,236 @@
+---
+# ============================================================
+# Patient Service – Kubernetes Deployment
+# Namespace: services
+# Replicas: 3 (HA across AZs)
+# ============================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: patient-service
+  namespace: services
+  labels:
+    app: patient-service
+    app.kubernetes.io/name: patient-service
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: medallionhealth
+    version: "1.0.0"
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: patient-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0       # Zero-downtime deploys
+  template:
+    metadata:
+      labels:
+        app: patient-service
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      serviceAccountName: patient-service-sa
+      terminationGracePeriodSeconds: 60   # Allow in-flight requests to complete
+
+      # Anti-affinity: spread across AZs
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: [patient-service]
+                topologyKey: topology.kubernetes.io/zone
+
+      containers:
+        - name: patient-service
+          image: 123456789.dkr.ecr.us-east-1.amazonaws.com/medallionhealth/patient-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+
+          # ── Resource Requests / Limits ─────────────────────────────────
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+
+          # ── Environment Variables ──────────────────────────────────────
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "aws"
+            - name: AWS_REGION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['topology.kubernetes.io/region']
+            - name: SPRING_DATASOURCE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: patient-service-db-secret
+                  key: jdbc-url
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: patient-service-db-secret
+                  key: username
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: patient-service-db-secret
+                  key: password
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: bootstrap-servers
+            - name: SCHEMA_REGISTRY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: schema-registry-url
+            - name: KMS_KEY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: medallionhealth-config
+                  key: pii-kms-key-id
+            - name: JAVA_OPTS
+              value: >
+                -XX:+UseContainerSupport
+                -XX:MaxRAMPercentage=75.0
+                -XX:+UseG1GC
+                -XX:+ExitOnOutOfMemoryError
+                -Dspring.backgroundpreinitializer.ignore=true
+
+          # ── Health Probes ──────────────────────────────────────────────
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 10          # Allow 300s for startup
+
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            failureThreshold: 3
+
+          # ── Lifecycle ─────────────────────────────────────────────────
+          lifecycle:
+            preStop:
+              exec:
+                # Give load balancer time to stop routing traffic
+                command: ["/bin/sh", "-c", "sleep 10"]
+
+          # ── Volume Mounts ─────────────────────────────────────────────
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      # Security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+---
+# ── Service ────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: patient-service
+  namespace: services
+  labels:
+    app: patient-service
+spec:
+  selector:
+    app: patient-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+
+---
+# ── HorizontalPodAutoscaler ───────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: patient-service-hpa
+  namespace: services
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: patient-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# ── PodDisruptionBudget ────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: patient-service-pdb
+  namespace: services
+spec:
+  minAvailable: 2               # Always keep 2 pods running during node maintenance
+  selector:
+    matchLabels:
+      app: patient-service
+
+---
+# ── ServiceAccount (for IRSA — IAM Roles for Service Accounts) ──
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: patient-service-sa
+  namespace: services
+  annotations:
+    # IRSA: This SA assumes an IAM role with KMS + Secrets Manager permissions
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/patient-service-role

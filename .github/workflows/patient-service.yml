@@ -1,0 +1,270 @@
+name: Patient Service CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'services/patient-service/**'
+      - '.github/workflows/patient-service.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'services/patient-service/**'
+
+env:
+  SERVICE_NAME: patient-service
+  SERVICE_PATH: services/patient-service
+  ECR_REPOSITORY: medallionhealth/patient-service
+  K8S_NAMESPACE: services
+  K8S_DEPLOYMENT: patient-service
+
+jobs:
+
+  # ── 1. Code Quality ────────────────────────────────────────────────────────
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Checkstyle
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: ./mvnw checkstyle:check -q
+
+      - name: SpotBugs Static Analysis
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: ./mvnw spotbugs:check -q
+
+  # ── 2. Unit Tests ──────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run unit tests
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: ./mvnw test -Dspring.profiles.active=test -q
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          files: ${{ env.SERVICE_PATH }}/target/site/jacoco/jacoco.xml
+          flags: patient-service
+          fail_ci_if_error: true
+
+  # ── 3. Integration Tests ───────────────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests (Testcontainers)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    services:
+      # Schema Registry needed for Kafka Avro tests
+      schema-registry:
+        image: confluentinc/cp-schema-registry:7.5.0
+        env:
+          SCHEMA_REGISTRY_HOST_NAME: schema-registry
+          SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: localhost:9092
+        ports:
+          - 8081:8081
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run integration tests
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: |
+          ./mvnw verify \
+            -Dspring.profiles.active=test \
+            -Dtest=*IntegrationTest \
+            -DfailIfNoTests=false
+        env:
+          SCHEMA_REGISTRY_URL: http://localhost:8081
+
+  # ── 4. Data Contract Validation ───────────────────────────────────────────
+  contract-validation:
+    name: Validate Data Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install contract validator
+        run: pip install -r data-platform/kafka/scripts/requirements.txt
+
+      - name: Validate Avro schemas match contracts
+        run: |
+          python data-platform/kafka/scripts/validate_contracts.py \
+            --contracts docs/data-contracts \
+            --schemas services/patient-service/src/main/avro
+
+  # ── 5. Build & Push Docker Image ──────────────────────────────────────────
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: [code-quality, unit-tests, integration-tests, contract-validation]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    permissions:
+      id-token: write   # OIDC for AWS auth
+      contents: read
+
+    outputs:
+      image_tag: ${{ steps.image-tag.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image tag
+        id: image-tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+          TAG="${{ github.ref_name }}-${SHORT_SHA}-$(date +%Y%m%d%H%M%S)"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: |
+          docker build \
+            --tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.tag }} \
+            --tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest \
+            --cache-from ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            .
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.tag }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.tag }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+  # ── 6. Deploy to Staging ──────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging (us-east-1)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN_STAGING }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name medallionhealth-staging --region us-east-1
+
+      - name: Deploy to EKS (staging)
+        run: |
+          kubectl set image deployment/${{ env.K8S_DEPLOYMENT }} \
+            ${{ env.SERVICE_NAME }}=${{ needs.build-and-push.outputs.image_tag }} \
+            -n ${{ env.K8S_NAMESPACE }}
+
+          kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=300s
+
+      - name: Run smoke tests
+        run: |
+          python tests/smoke/test_patient_service.py \
+            --base-url ${{ secrets.STAGING_PATIENT_SERVICE_URL }}
+
+  # ── 7. Deploy to Production ───────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production (Multi-Region)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: production       # Requires manual approval in GitHub Environments
+
+    strategy:
+      matrix:
+        region: [us-east-1, us-west-2, eu-central-1]
+      max-parallel: 1             # Deploy one region at a time (rolling)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name medallionhealth-prod-${{ matrix.region }} \
+            --region ${{ matrix.region }}
+
+      - name: Deploy to EKS (${{ matrix.region }})
+        run: |
+          kubectl set image deployment/${{ env.K8S_DEPLOYMENT }} \
+            ${{ env.SERVICE_NAME }}=${{ needs.build-and-push.outputs.image_tag }} \
+            -n ${{ env.K8S_NAMESPACE }}
+
+          kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=300s
+
+      - name: Verify deployment health
+        run: |
+          sleep 30
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=${{ env.K8S_DEPLOYMENT }}
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOY_CHANNEL }}
+          slack-message: |
+            ✅ *${{ env.SERVICE_NAME }}* deployed to production `${{ matrix.region }}`
+            Version: `${{ needs.build-and-push.outputs.image_tag }}`
+            Commit: ${{ github.sha }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
